@@ -1,0 +1,740 @@
+From 01ef1a821a072b181d99a46b9f8422270b3b4d95 Mon Sep 17 00:00:00 2001
+From: Bhanuprakash0807 <reddembhanu368@gmai.com>
+Date: Sun, 14 Sep 2025 01:45:54 +0530
+Subject: [PATCH 1/2] Modifications for xv6 done
+
+---
+ .gdbinit.tmpl-riscv |   2 -
+ .vscode/launch.json |  24 ++++
+ Makefile            |   7 +-
+ kernel/proc.c       | 270 +++++++++++++++++++++++++++++++++++++-------
+ kernel/proc.h       |  17 +++
+ kernel/syscall.c    |   4 +
+ kernel/syscall.h    |   2 +
+ kernel/sysfile.c    |  12 +-
+ kernel/sysproc.c    |  15 +++
+ kernel/trap.c       |  23 ++++
+ user/readcount.c    |  30 +++++
+ user/user.h         |   3 +
+ user/usys.pl        |   2 +
+ 13 files changed, 363 insertions(+), 48 deletions(-)
+ create mode 100644 .vscode/launch.json
+ create mode 100644 user/readcount.c
+
+diff --git a/.gdbinit.tmpl-riscv b/.gdbinit.tmpl-riscv
+index a2bfde3..e90cb2e 100644
+--- a/.gdbinit.tmpl-riscv
++++ b/.gdbinit.tmpl-riscv
+@@ -1,6 +1,4 @@
+ set confirm off
+ set architecture riscv:rv64
+-target remote 127.0.0.1:1234
+-symbol-file kernel/kernel
+ set disassemble-next-line auto
+ set riscv use-compressed-breakpoints yes
+diff --git a/.vscode/launch.json b/.vscode/launch.json
+new file mode 100644
+index 0000000..3ca50a4
+--- /dev/null
++++ b/.vscode/launch.json
+@@ -0,0 +1,24 @@
++{
++    "version": "0.2.0",
++    "configurations": [
++        {
++            "name": "Debug",
++            "type": "cppdbg",
++            "request": "launch",
++            // "program": "${workspaceFolder}/kernel/kernel", // kernel land program
++            "program": "${workspaceFolder}/user/_wc", // user land program
++            "cwd": "${workspaceFolder}",
++            "miDebuggerPath": "path_to_riscv64-elf-gdb",
++            "miDebuggerServerAddress": "127.0.0.1:<port>",
++            "MIMode": "gdb",
++            "stopAtEntry": true,
++            "setupCommands": [
++                {
++                    "description": "Enable pretty-printing for gdb",
++                    "text": "-enable-pretty-printing",
++                    "ignoreFailures": false
++                }
++            ]
++        }
++    ]
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 4e998d8..97af47b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -28,7 +28,7 @@ OBJS = \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+-  $K/virtio_disk.o
++  $K/virtio_disk.o 
+ 
+ # riscv64-unknown-elf- or riscv64-linux-gnu-
+ # perhaps in /opt/riscv/bin
+@@ -72,6 +72,7 @@ CFLAGS += -fno-builtin-memcpy -Wno-main
+ CFLAGS += -fno-builtin-printf -fno-builtin-fprintf -fno-builtin-vprintf
+ CFLAGS += -I.
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++CFLAGS += -DSCHEDULER=$(SCHEDULER)
+ 
+ # Disable PIE when possible (for Ubuntu 16.10 toolchain)
+ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
+@@ -97,7 +98,7 @@ tags: $(OBJS)
+ ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
+ 
+ _%: %.o $(ULIB) $U/user.ld
+-	$(LD) $(LDFLAGS) -T $U/user.ld -o $@ $< $(ULIB)
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -T $U/user.ld -o $@ $< $(ULIB)
+ 	$(OBJDUMP) -S $@ > $*.asm
+ 	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
+ 
+@@ -142,6 +143,8 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_readcount\
++	
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 9d6cf3f..3b1555f 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -43,6 +43,8 @@ proc_mapstacks(pagetable_t kpgtbl)
+   }
+ }
+ 
++
++
+ // initialize the proc table.
+ void
+ procinit(void)
+@@ -102,6 +104,28 @@ allocpid()
+   return pid;
+ }
+ 
++
++
++// weight = 1024 / (1.25 ^ nice) approximation using integer math
++uint64 nice_to_weight(int nice) {
++    uint64 w = 1024;
++
++    if(nice > 0){
++        for(int i = 0; i < nice; i++){
++            w = w * 4 / 5;   // divide by 1.25
++        }
++    } else if(nice < 0){
++        for(int i = 0; i < -nice; i++){
++            w = w * 5 / 4;   // multiply by 1.25
++        }
++    }
++
++    if(w < 1) w = 1;
++    return w;
++}
++
++
++
+ // Look in the process table for an UNUSED proc.
+ // If found, initialize state required to run in the kernel,
+ // and return with p->lock held.
+@@ -124,6 +148,17 @@ allocproc(void)
+ found:
+   p->pid = allocpid();
+   p->state = USED;
++  p->creation_time = ticks;   
++
++
++  // Initialize CFS fields
++  p->nice = 0;                    // Default nice value
++  p->vruntime = 0;               // Start with 0 virtual runtime
++  p->weight = nice_to_weight(p->nice);              // Default weight for nice 0
++  p->time_slice = 0;
++  p->slice_start = 0;
++
++
+ 
+   // Allocate a trapframe page.
+   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+@@ -145,7 +180,7 @@ found:
+   memset(&p->context, 0, sizeof(p->context));
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+-
++  
+   return p;
+ }
+ 
+@@ -418,46 +453,46 @@ kwait(uint64 addr)
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
+-void
+-scheduler(void)
+-{
+-  struct proc *p;
+-  struct cpu *c = mycpu();
+-
+-  c->proc = 0;
+-  for(;;){
+-    // The most recent process to run may have had interrupts
+-    // turned off; enable them to avoid a deadlock if all
+-    // processes are waiting. Then turn them back off
+-    // to avoid a possible race between an interrupt
+-    // and wfi.
+-    intr_on();
+-    intr_off();
+-
+-    int found = 0;
+-    for(p = proc; p < &proc[NPROC]; p++) {
+-      acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-        found = 1;
+-      }
+-      release(&p->lock);
+-    }
+-    if(found == 0) {
+-      // nothing to run; stop running on this core until an interrupt.
+-      asm volatile("wfi");
+-    }
+-  }
+-}
++// void
++// scheduler(void)
++// {
++//   struct proc *p;
++//   struct cpu *c = mycpu();
++
++//   c->proc = 0;
++//   for(;;){
++//     // The most recent process to run may have had interrupts
++//     // turned off; enable them to avoid a deadlock if all
++//     // processes are waiting. Then turn them back off
++//     // to avoid a possible race between an interrupt
++//     // and wfi.
++//     intr_on();
++//     intr_off();
++
++//     int found = 0;
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         // Switch to chosen process.  It is the process's job
++//         // to release its lock and then reacquire it
++//         // before jumping back to us.
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++
++//         // Process is done running for now.
++//         // It should have changed its p->state before coming back.
++//         c->proc = 0;
++//         found = 1;
++//       }
++//       release(&p->lock);
++//     }
++//     if(found == 0) {
++//       // nothing to run; stop running on this core until an interrupt.
++//       asm volatile("wfi");
++//     }
++//   }
++// }
+ 
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+@@ -682,6 +717,159 @@ procdump(void)
+     else
+       state = "???";
+     printf("%d %s %s", p->pid, state, p->name);
++   
+     printf("\n");
+   }
+ }
++
++void
++scheduler(void)
++{
++  // struct proc *p;
++  struct cpu *c = mycpu();
++
++  c->proc = 0;
++  for(;;){
++    // The most recent process to run may have had interrupts
++    // turned off; enable them to avoid a deadlock if all
++    // processes are waiting. Then turn them back off
++    // to avoid a possible race between an interrupt
++    // and wfi.
++    intr_on();
++    intr_off();
++    
++    #if SCHEDULER == FCFS
++        struct proc* p;
++        struct proc* min_p=0;
++        for(p=proc;p<&proc[NPROC];p++){
++          acquire(&p->lock);
++          if(p->state!=RUNNABLE){
++            release(&p->lock);
++            continue;
++          }
++          if(!min_p || p->creation_time < min_p->creation_time){
++            if(min_p){
++              release(&min_p->lock);
++            }
++            min_p=p;
++          }
++          else{
++            release(&p->lock);
++          }
++        }
++        if(min_p){
++          min_p->state=RUNNING;
++          c->proc=min_p;
++          swtch(&c->context,&min_p->context);
++          c->proc=0;
++          release(&min_p->lock);
++        }
++        else{
++          asm volatile("wfi");
++        }
++
++    #elif SCHEDULER == CFS
++
++
++    struct proc *p;
++    struct proc *min_p = 0;
++    uint64 min_vruntime = 0;
++    int runnable_count = 0;
++
++    printf("[Scheduler Tick]\n");
++    for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->state == RUNNABLE) {
++        printf("PID: %d | vRuntime: %ld\n", p->pid, p->vruntime);
++    }
++    release(&p->lock);
++}
++
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE) {
++        runnable_count++;
++            // printf("PID: %d | vRuntime: %ld\n", p->pid, p->vruntime);
++
++            if(min_p == 0 || p->vruntime < min_vruntime) {
++                if(min_p){
++                  release(&min_p->lock); 
++                } 
++                min_vruntime = p->vruntime;
++                min_p = p;
++            } else {
++                release(&p->lock);
++            }
++        } 
++        else {
++            release(&p->lock);
++        }
++    }
++
++    if(min_p) {
++      printf("--> Scheduling PID %d (lowest vRuntime)\n", min_p->pid);
++
++        const uint64 TARGET_LATENCY = 48;
++        const uint64 MIN_TIME_SLICE = 3;
++
++        uint64 time_slice = (runnable_count > 0) ? TARGET_LATENCY / runnable_count : MIN_TIME_SLICE;
++        if(time_slice < MIN_TIME_SLICE) {
++          time_slice = MIN_TIME_SLICE;
++        }
++
++        min_p->time_slice = time_slice;
++        min_p->slice_start = ticks;
++
++        
++        if(min_p->weight == 0){
++            min_p->weight = nice_to_weight(min_p->nice);  
++
++        }
++      
++      
++        min_p->state = RUNNING;
++        c->proc = min_p;
++        swtch(&c->context, &min_p->context);
++
++      
++        uint64 runtime = ticks - min_p->slice_start;
++        if(runtime > 0 && min_p->weight > 0){
++            min_p->vruntime += (runtime * 1024) / min_p->weight;
++
++        }
++
++        c->proc = 0;
++        release(&min_p->lock);
++    } else {
++      
++        asm volatile("wfi");
++    }
++
++    #else 
++      struct proc *p;
++      int found = 0;
++      for(p = proc; p < &proc[NPROC]; p++) {
++        acquire(&p->lock);
++        if(p->state == RUNNABLE) {
++          // Switch to chosen process.  It is the process's job
++          // to release its lock and then reacquire it
++          // before jumping back to us.
++          p->state = RUNNING;
++          c->proc = p;
++          swtch(&c->context, &p->context);
++
++          // Process is done running for now.
++          // It should have changed its p->state before coming back.
++          c->proc = 0;
++          found = 1;
++        }
++        release(&p->lock);
++      }
++      if(found == 0) {
++        // nothing to run; stop running on this core until an interrupt.
++        asm volatile("wfi");
++      }
++
++  #endif
++  }
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..b5bb24d 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -1,3 +1,10 @@
++#define RR   0
++#define FCFS 1
++#define CFS  2
++#ifndef SCHEDULER
++#define SCHEDULER RR
++#endif
++
+ // Saved registers for kernel context switches.
+ struct context {
+   uint64 ra;
+@@ -104,4 +111,14 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  uint64 creation_time;
++
++
++
++    // CFS-related fields
++  int nice;                    // Nice value (-20 to 19)
++  uint64 vruntime;            // Virtual runtime
++  uint64 weight;              // Process weight based on nice value
++  uint64 time_slice;          // Current time slice
++  uint64 slice_start;         // When current slice started
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 076d965..139e15c 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_hello(void);
++extern uint64 sys_getreadcount(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_hello]   sys_hello,
++[SYS_getreadcount] sys_getreadcount,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 3dd926d..49f7ce2 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_hello  22
++#define SYS_getreadcount 23
+\ No newline at end of file
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index d8234ce..3331aa1 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -16,6 +16,7 @@
+ #include "file.h"
+ #include "fcntl.h"
+ 
++extern unsigned long long read_bytes;
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+ static int
+@@ -74,9 +75,15 @@ sys_read(void)
+ 
+   argaddr(1, &p);
+   argint(2, &n);
+-  if(argfd(0, 0, &f) < 0)
++  if(argfd(0, 0, &f) < 0){
+     return -1;
+-  return fileread(f, p, n);
++  }
++  int bytes_read = fileread(f, p, n);
++  if(bytes_read>0){
++   extern unsigned long long read_bytes;
++    read_bytes += bytes_read;
++  }
++  return bytes_read;
+ }
+ 
+ uint64
+@@ -90,7 +97,6 @@ sys_write(void)
+   argint(2, &n);
+   if(argfd(0, 0, &f) < 0)
+     return -1;
+-
+   return filewrite(f, p, n);
+ }
+ 
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3044d00..abb5225 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -105,3 +105,18 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_hello(void)
++{
++  printf("Hello World!\n");
++  return 0;
++}
++
++
++unsigned long long read_bytes=0;
++uint64
++sys_getreadcount(void)
++{
++  return read_bytes;
++}
+\ No newline at end of file
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a82294f..3f589fb 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -168,6 +168,29 @@ clockintr()
+     acquire(&tickslock);
+     ticks++;
+     wakeup(&ticks);
++#if SCHEDULER == CFS
++    struct proc *p = myproc();
++    if(p){
++        acquire(&p->lock);  
++        if(p->state == RUNNING){
++          
++            if(p->time_slice > 0)
++                p->time_slice--;
++
++          
++            if(p->time_slice == 0){   
++                release(&p->lock);  
++                yield();           
++            } else {
++                release(&p->lock);
++            }
++        } else {
++            release(&p->lock);
++        }
++    }
++#endif
++
++
+     release(&tickslock);
+   }
+ 
+diff --git a/user/readcount.c b/user/readcount.c
+new file mode 100644
+index 0000000..a6c3fa5
+--- /dev/null
++++ b/user/readcount.c
+@@ -0,0 +1,30 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++int main(){
++    uint64 ini_cnt= getreadcount();
++    char buf[101];
++    printf("Initial read count: %lu\n",ini_cnt);
++    int fd = open("README",O_RDONLY);
++    if(fd<0){
++      printf("Error: Unable to open file\n");
++      exit(1);
++    }
++    int n = read(fd,buf,100);
++    buf[n] = '\0';
++    uint64 final_cnt = getreadcount();
++    printf("Final read count: %lu\n",final_cnt); 
++    uint64 diff= final_cnt - ini_cnt;
++    if(diff<=0){
++      printf("Error: Read count did not increase after read operation\n");
++      exit(1);
++    }
++    else{
++        printf("Read count increased by %lu after read operation\n",diff);
++    }
++    exit(0);
++    
++    
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index ac84de9..67a77d3 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -24,6 +24,9 @@ int getpid(void);
+ char* sys_sbrk(int,int);
+ int pause(int);
+ int uptime(void);
++int hello(void);
++uint64 getreadcount(void);
++
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index c5d4c3a..1c06e88 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -42,3 +42,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("pause");
+ entry("uptime");
++entry("hello");
++entry("getreadcount");
+-- 
+2.43.0
+
+
+From 09c3bd89e8e0c858e9c66743518c6a0ad9983359 Mon Sep 17 00:00:00 2001
+From: Bhanuprakash0807 <reddembhanu368@gmai.com>
+Date: Sun, 14 Sep 2025 01:49:35 +0530
+Subject: [PATCH 2/2] xv6 part done
+
+---
+ kernel/proc.c | 51 ++-------------------------------------------------
+ kernel/proc.h |  2 +-
+ 2 files changed, 3 insertions(+), 50 deletions(-)
+
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 3b1555f..adcccaa 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -446,53 +446,7 @@ kwait(uint64 addr)
+   }
+ }
+ 
+-// Per-CPU process scheduler.
+-// Each CPU calls scheduler() after setting itself up.
+-// Scheduler never returns.  It loops, doing:
+-//  - choose a process to run.
+-//  - swtch to start running that process.
+-//  - eventually that process transfers control
+-//    via swtch back to the scheduler.
+-// void
+-// scheduler(void)
+-// {
+-//   struct proc *p;
+-//   struct cpu *c = mycpu();
+-
+-//   c->proc = 0;
+-//   for(;;){
+-//     // The most recent process to run may have had interrupts
+-//     // turned off; enable them to avoid a deadlock if all
+-//     // processes are waiting. Then turn them back off
+-//     // to avoid a possible race between an interrupt
+-//     // and wfi.
+-//     intr_on();
+-//     intr_off();
+-
+-//     int found = 0;
+-//     for(p = proc; p < &proc[NPROC]; p++) {
+-//       acquire(&p->lock);
+-//       if(p->state == RUNNABLE) {
+-//         // Switch to chosen process.  It is the process's job
+-//         // to release its lock and then reacquire it
+-//         // before jumping back to us.
+-//         p->state = RUNNING;
+-//         c->proc = p;
+-//         swtch(&c->context, &p->context);
+-
+-//         // Process is done running for now.
+-//         // It should have changed its p->state before coming back.
+-//         c->proc = 0;
+-//         found = 1;
+-//       }
+-//       release(&p->lock);
+-//     }
+-//     if(found == 0) {
+-//       // nothing to run; stop running on this core until an interrupt.
+-//       asm volatile("wfi");
+-//     }
+-//   }
+-// }
++
+ 
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+@@ -716,8 +670,7 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
+-   
++  
+     printf("\n");
+   }
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index b5bb24d..a0e7d42 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -116,7 +116,7 @@ struct proc {
+ 
+ 
+     // CFS-related fields
+-  int nice;                    // Nice value (-20 to 19)
++  int nice;                    // Nice value 
+   uint64 vruntime;            // Virtual runtime
+   uint64 weight;              // Process weight based on nice value
+   uint64 time_slice;          // Current time slice
+-- 
+2.43.0
+

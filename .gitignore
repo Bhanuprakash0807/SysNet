@@ -1,0 +1,29 @@
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Common build artifacts
+*.o
+*.obj
+*.out
+*.exe
+*.a
+*.so
+*.dylib
+
+# Reliable UDP Protocol
+/reliable-udp-protocol/client
+/reliable-udp-protocol/server
+/reliable-udp-protocol/*.log
+/reliable-udp-protocol/received_file.txt
+
+# Custom Shell
+/custom-shell/obj/
+/custom-shell/bin/
+/custom-shell/shell.out
+/custom-shell/.shell_log
+
+# Local logs
+*.log
